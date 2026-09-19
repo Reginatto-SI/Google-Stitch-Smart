@@ -42,7 +42,7 @@ test("readScreens preserva o contrato de list_screens", async () => {
   assert.equal(result.screens[0].screenId, "8201923b79164cc4b4297aafdb4dd30c");
 });
 
-test("readScreenContent usa callTool get_screen somente com projectId e screenId", async () => {
+test("readScreenContent usa callTool get_screen com resource name canônico", async () => {
   const calls = [];
   const client = {
     async callTool(name, args) {
@@ -69,8 +69,7 @@ test("readScreenContent usa callTool get_screen somente com projectId e screenId
   assert.deepEqual(calls, [{
     name: "get_screen",
     args: {
-      projectId: "12034049487696062869",
-      screenId: "8201923b79164cc4b4297aafdb4dd30c",
+      name: "projects/12034049487696062869/screens/8201923b79164cc4b4297aafdb4dd30c",
     },
   }]);
   assert.equal(result.content.length, 1);

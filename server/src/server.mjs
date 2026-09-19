@@ -8,7 +8,7 @@ import * as z from "zod/v4";
 import { PROMPT_POLICY } from "./prompt-policy.mjs";
 import { readProjects, readScreens, readScreenContent } from "./stitch-read.mjs";
 
-const VERSION = "0.2.4";
+const VERSION = "0.2.5";
 const PORT = Number(process.env.PORT || 3000);
 const MAX_HTML_CHARS = Number(process.env.MAX_HTML_CHARS || 60000);
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN?.trim() || "";

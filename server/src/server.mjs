@@ -3,14 +3,56 @@ import { createServer as createHttpServer } from "node:http";
 import { createHash } from "node:crypto";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { stitch } from "@google/stitch-sdk";
+import { Stitch, StitchToolClient } from "@google/stitch-sdk";
 import * as z from "zod/v4";
 import { PROMPT_POLICY } from "./prompt-policy.mjs";
 
-const VERSION = "0.2.1";
+const VERSION = "0.2.2";
 const PORT = Number(process.env.PORT || 3000);
 const MAX_HTML_CHARS = Number(process.env.MAX_HTML_CHARS || 60000);
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN?.trim() || "";
+
+if (!process.env.STITCH_API_KEY && !process.env.STITCH_ACCESS_TOKEN) {
+  console.warn(
+    "[google-stitch-smart] STITCH_API_KEY/STITCH_ACCESS_TOKEN não definido. Ferramentas do Stitch falharão até a credencial ser configurada."
+  );
+}
+
+function createStitchSession() {
+  const apiKey = process.env.STITCH_API_KEY?.trim() || "";
+  const accessToken = process.env.STITCH_ACCESS_TOKEN?.trim() || "";
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || "";
+
+  if (!apiKey && !accessToken) {
+    throw new Error("STITCH_API_KEY/STITCH_ACCESS_TOKEN não configurado");
+  }
+  if (!apiKey && accessToken && !projectId) {
+    throw new Error("GOOGLE_CLOUD_PROJECT é obrigatório quando STITCH_ACCESS_TOKEN é usado");
+  }
+
+  const client = new StitchToolClient({
+    ...(apiKey ? { apiKey } : {}),
+    ...(!apiKey && accessToken ? { accessToken, projectId } : {}),
+  });
+
+  return { client, stitch: new Stitch(client) };
+}
+
+async function withStitchSession(operation) {
+  const { client, stitch } = createStitchSession();
+  try {
+    return await operation(stitch);
+  } finally {
+    try {
+      await client.close();
+    } catch (closeError) {
+      console.warn(
+        "[google-stitch-smart] falha ao fechar sessão Stitch",
+        closeError?.message || closeError
+      );
+    }
+  }
+}
 
 function textResult(value) {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
@@ -69,7 +111,7 @@ async function screenInfo(screen) {
   };
 }
 
-async function screenContent(projectId, screenId, { includeImage = true, includeHtml = false } = {}) {
+async function screenContent(stitch, projectId, screenId, { includeImage = true, includeHtml = false } = {}) {
   const project = stitch.project(projectId);
   const screen = await project.getScreen(screenId);
   const htmlUrl = await screen.getHtml();
@@ -142,10 +184,12 @@ function buildServer() {
     },
     async () => {
       try {
-        const projects = await stitch.projects();
-        return textResult({
-          count: projects.length,
-          projects: projects.map((p) => ({ projectId: p.projectId, id: p.id })),
+        return await withStitchSession(async (stitch) => {
+          const projects = await stitch.projects();
+          return textResult({
+            count: projects.length,
+            projects: projects.map((p) => ({ projectId: p.projectId, id: p.id })),
+          });
         });
       } catch (error) {
         return errorResult(error);
@@ -162,8 +206,10 @@ function buildServer() {
     },
     async ({ title }) => {
       try {
-        const project = await stitch.createProject(title);
-        return textResult({ projectId: project.projectId, id: project.id, title });
+        return await withStitchSession(async (stitch) => {
+          const project = await stitch.createProject(title);
+          return textResult({ projectId: project.projectId, id: project.id, title });
+        });
       } catch (error) {
         return errorResult(error);
       }
@@ -179,11 +225,13 @@ function buildServer() {
     },
     async ({ projectId }) => {
       try {
-        const screens = await stitch.project(projectId).screens();
-        return textResult({
-          projectId,
-          count: screens.length,
-          screens: await Promise.all(screens.map(screenInfo)),
+        return await withStitchSession(async (stitch) => {
+          const screens = await stitch.project(projectId).screens();
+          return textResult({
+            projectId,
+            count: screens.length,
+            screens: await Promise.all(screens.map(screenInfo)),
+          });
         });
       } catch (error) {
         return errorResult(error);
@@ -205,7 +253,9 @@ function buildServer() {
     },
     async (args) => {
       try {
-        return await screenContent(args.projectId, args.screenId, args);
+        return await withStitchSession((stitch) =>
+          screenContent(stitch, args.projectId, args.screenId, args)
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -226,16 +276,18 @@ function buildServer() {
     },
     async ({ projectId, prompt, deviceType, returnImage }) => {
       try {
-        const project = stitch.project(projectId);
-        const screen = await project.generate(prompt, deviceType);
-        const htmlUrl = await screen.getHtml();
-        const imageUrl = await screen.getImage();
-        const content = [{
-          type: "text",
-          text: JSON.stringify({ projectId, screenId: screen.screenId, htmlUrl, imageUrl }, null, 2),
-        }];
-        if (returnImage && imageUrl) content.push(await downloadImage(imageUrl));
-        return { content };
+        return await withStitchSession(async (stitch) => {
+          const project = stitch.project(projectId);
+          const screen = await project.generate(prompt, deviceType);
+          const htmlUrl = await screen.getHtml();
+          const imageUrl = await screen.getImage();
+          const content = [{
+            type: "text",
+            text: JSON.stringify({ projectId, screenId: screen.screenId, htmlUrl, imageUrl }, null, 2),
+          }];
+          if (returnImage && imageUrl) content.push(await downloadImage(imageUrl));
+          return { content };
+        });
       } catch (error) {
         return errorResult(error);
       }
@@ -258,38 +310,40 @@ function buildServer() {
     },
     async ({ projectId, screenId, prompt, deviceType, modelId, returnImage }) => {
       try {
-        const source = await stitch.project(projectId).getScreen(screenId);
-        const beforeHtmlUrl = await source.getHtml();
-        const beforeHtml = await fullText(beforeHtmlUrl);
-        const refinedPrompt = `${prompt.trim()}\n\n${PROMPT_POLICY.editPreservationClause}`;
-        const edited = await source.edit(refinedPrompt, deviceType, modelId);
-        const htmlUrl = await edited.getHtml();
-        const imageUrl = await edited.getImage();
+        return await withStitchSession(async (stitch) => {
+          const source = await stitch.project(projectId).getScreen(screenId);
+          const beforeHtmlUrl = await source.getHtml();
+          const beforeHtml = await fullText(beforeHtmlUrl);
+          const refinedPrompt = `${prompt.trim()}\n\n${PROMPT_POLICY.editPreservationClause}`;
+          const edited = await source.edit(refinedPrompt, deviceType, modelId);
+          const htmlUrl = await edited.getHtml();
+          const imageUrl = await edited.getImage();
 
-        let persistenceVerified = null;
-        try {
-          const afterHtml = await fullText(htmlUrl);
-          persistenceVerified = hash(beforeHtml) !== hash(afterHtml);
-        } catch {
-          persistenceVerified = null;
-        }
+          let persistenceVerified = null;
+          try {
+            const afterHtml = await fullText(htmlUrl);
+            persistenceVerified = hash(beforeHtml) !== hash(afterHtml);
+          } catch {
+            persistenceVerified = null;
+          }
 
-        const content = [{
-          type: "text",
-          text: JSON.stringify({
-            projectId,
-            sourceScreenId: screenId,
-            resultScreenId: edited.screenId,
-            htmlUrl,
-            imageUrl,
-            persistenceVerified,
-            warning: persistenceVerified === false
-              ? "O Stitch respondeu à edição, mas o HTML não mudou. Não considere a alteração aplicada sem revisão visual."
-              : undefined,
-          }, null, 2),
-        }];
-        if (returnImage && imageUrl) content.push(await downloadImage(imageUrl));
-        return { ...(persistenceVerified === false ? { isError: true } : {}), content };
+          const content = [{
+            type: "text",
+            text: JSON.stringify({
+              projectId,
+              sourceScreenId: screenId,
+              resultScreenId: edited.screenId,
+              htmlUrl,
+              imageUrl,
+              persistenceVerified,
+              warning: persistenceVerified === false
+                ? "O Stitch respondeu à edição, mas o HTML não mudou. Não considere a alteração aplicada sem revisão visual."
+                : undefined,
+            }, null, 2),
+          }];
+          if (returnImage && imageUrl) content.push(await downloadImage(imageUrl));
+          return { ...(persistenceVerified === false ? { isError: true } : {}), content };
+        });
       } catch (error) {
         return errorResult(error);
       }
@@ -313,28 +367,30 @@ function buildServer() {
     },
     async ({ projectId, screenId, prompt, variantCount, creativeRange, aspects, returnImages }) => {
       try {
-        const source = await stitch.project(projectId).getScreen(screenId);
-        const variants = await source.variants(prompt, {
-          variantCount,
-          creativeRange,
-          ...(aspects?.length ? { aspects } : {}),
-        });
-        const rows = [];
-        for (const variant of variants) {
-          rows.push({
-            screenId: variant.screenId,
-            htmlUrl: await variant.getHtml(),
-            imageUrl: await variant.getImage(),
+        return await withStitchSession(async (stitch) => {
+          const source = await stitch.project(projectId).getScreen(screenId);
+          const variants = await source.variants(prompt, {
+            variantCount,
+            creativeRange,
+            ...(aspects?.length ? { aspects } : {}),
           });
-        }
-        const content = [{ type: "text", text: JSON.stringify({ projectId, sourceScreenId: screenId, variants: rows }, null, 2) }];
-        if (returnImages) {
-          for (const row of rows) {
-            content.push({ type: "text", text: `VARIANTE screenId=${row.screenId}` });
-            content.push(await downloadImage(row.imageUrl));
+          const rows = [];
+          for (const variant of variants) {
+            rows.push({
+              screenId: variant.screenId,
+              htmlUrl: await variant.getHtml(),
+              imageUrl: await variant.getImage(),
+            });
           }
-        }
-        return { content };
+          const content = [{ type: "text", text: JSON.stringify({ projectId, sourceScreenId: screenId, variants: rows }, null, 2) }];
+          if (returnImages) {
+            for (const row of rows) {
+              content.push({ type: "text", text: `VARIANTE screenId=${row.screenId}` });
+              content.push(await downloadImage(row.imageUrl));
+            }
+          }
+          return { content };
+        });
       } catch (error) {
         return errorResult(error);
       }

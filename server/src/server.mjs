@@ -7,10 +7,15 @@ import { Stitch, StitchToolClient } from "@google/stitch-sdk";
 import * as z from "zod/v4";
 import { PROMPT_POLICY } from "./prompt-policy.mjs";
 import { readProjects, readScreens, readScreenContent } from "./stitch-read.mjs";
+import { formatGenerationResult, runGenerationFlow } from "./stitch-generate.mjs";
 
-const VERSION = "0.2.5";
+const VERSION = "0.2.6";
 const PORT = Number(process.env.PORT || 3000);
 const MAX_HTML_CHARS = Number(process.env.MAX_HTML_CHARS || 60000);
+const configuredGenerationTimeout = Number(process.env.STITCH_GENERATION_TIMEOUT_MS || 45000);
+const STITCH_GENERATION_TIMEOUT_MS = Number.isFinite(configuredGenerationTimeout) && configuredGenerationTimeout >= 5000
+  ? configuredGenerationTimeout
+  : 45000;
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN?.trim() || "";
 const GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/aida";
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -163,23 +168,26 @@ async function refreshGoogleAccessToken() {
   return cachedOAuthToken.accessToken;
 }
 
-async function createStitchSession() {
+async function createStitchSession({ timeout } = {}) {
   const status = authStatus();
   const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || "";
+  const timeoutOptions = Number.isFinite(timeout) ? { timeout } : {};
 
   let client;
 
   if (status.mode === "oauth_refresh_token") {
     const accessToken = await refreshGoogleAccessToken();
-    client = new StitchToolClient({ accessToken, projectId });
+    client = new StitchToolClient({ accessToken, projectId, ...timeoutOptions });
   } else if (status.mode === "static_access_token") {
     client = new StitchToolClient({
       accessToken: process.env.STITCH_ACCESS_TOKEN.trim(),
       projectId,
+      ...timeoutOptions,
     });
   } else if (status.mode === "api_key") {
     client = new StitchToolClient({
       apiKey: process.env.STITCH_API_KEY.trim(),
+      ...timeoutOptions,
     });
   } else {
     throw new Error(
@@ -190,8 +198,8 @@ async function createStitchSession() {
   return { client, stitch: new Stitch(client) };
 }
 
-async function withStitchSession(operation) {
-  const { client, stitch } = await createStitchSession();
+async function withStitchSession(operation, options) {
+  const { client, stitch } = await createStitchSession(options);
   try {
     return await operation(stitch, client);
   } finally {
@@ -267,6 +275,7 @@ function buildServer() {
         "Em edição, altere apenas o que foi pedido e preserve todo o restante.",
         "Depois de gerar ou editar, analise a imagem retornada antes de afirmar que o resultado ficou correto.",
         "Não execute uma segunda alteração automaticamente sem novo pedido do usuário.",
+        "Em stitch_generate_screen, timeout ou erro de conexão é inconclusivo: não repita a geração automaticamente; liste e reconcilie as telas antes de qualquer nova tentativa.",
       ].join(" "),
     }
   );
@@ -383,7 +392,7 @@ function buildServer() {
   server.registerTool(
     "stitch_generate_screen",
     {
-      description: "Gera uma nova tela em um projeto Stitch. O prompt deve estar refinado e coerente com o PRD/design system disponíveis.",
+      description: "Gera uma nova tela em um projeto Stitch. Operações podem levar minutos. Timeout ou erro de conexão não significa falha definitiva: não repita a geração imediatamente. O retorno pode indicar completed_after_timeout, generation_pending ou generation_ambiguous; nesses casos consulte/reconcilie as telas antes de nova tentativa.",
       inputSchema: z.object({
         projectId: z.string().min(1),
         prompt: z.string().min(1),
@@ -394,18 +403,55 @@ function buildServer() {
     },
     async ({ projectId, prompt, deviceType, returnImage }) => {
       try {
-        return await withStitchSession(async (stitch) => {
-          const project = stitch.project(projectId);
-          const screen = await project.generate(prompt, deviceType);
-          const htmlUrl = await screen.getHtml();
-          const imageUrl = await screen.getImage();
-          const content = [{
-            type: "text",
-            text: JSON.stringify({ projectId, screenId: screen.screenId, htmlUrl, imageUrl }, null, 2),
-          }];
-          if (returnImage && imageUrl) content.push(await downloadImage(imageUrl));
-          return { content };
+        const result = await runGenerationFlow({
+          projectId,
+          listScreens: (targetProjectId) =>
+            withStitchSession(async (stitch) =>
+              readScreens(stitch, targetProjectId)
+            ),
+          generateScreen: () =>
+            withStitchSession(async (stitch) => {
+              const project = stitch.project(projectId);
+              const screen = await project.generate(prompt, deviceType);
+              let htmlUrl = "";
+              let imageUrl = "";
+              let imageContent;
+              const warnings = [];
+
+              try {
+                htmlUrl = await screen.getHtml();
+              } catch (assetError) {
+                warnings.push(`HTML não pôde ser obtido após a criação: ${assetError?.message || assetError}`);
+              }
+
+              try {
+                imageUrl = await screen.getImage();
+              } catch (assetError) {
+                warnings.push(`Screenshot não pôde ser obtido após a criação: ${assetError?.message || assetError}`);
+              }
+
+              if (returnImage && imageUrl) {
+                try {
+                  imageContent = await downloadImage(imageUrl);
+                } catch (assetError) {
+                  warnings.push(`Screenshot foi criada, mas não pôde ser baixada pelo plugin: ${assetError?.message || assetError}`);
+                }
+              }
+
+              return {
+                projectId,
+                screenId: screen.screenId,
+                htmlUrl,
+                imageUrl,
+                imageContent,
+                ...(warnings.length ? {
+                  warning: `A tela foi criada, porém houve falha ao obter alguns artefatos. ${warnings.join(" ")}`,
+                } : {}),
+              };
+            }, { timeout: STITCH_GENERATION_TIMEOUT_MS }),
         });
+
+        return formatGenerationResult(result);
       } catch (error) {
         return errorResult(error);
       }

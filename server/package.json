@@ -1,6 +1,6 @@
 {
   "name": "google-stitch-smart-mcp",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "description": "MCP bridge for Google Stitch with prompt-engineering-aware workflow for ChatGPT and Codex",

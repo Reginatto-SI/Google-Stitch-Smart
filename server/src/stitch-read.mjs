@@ -40,12 +40,10 @@ export async function readScreenContent(
   const normalizedProjectId = requireId(projectId, "projectId");
   const normalizedScreenId = requireId(screenId, "screenId");
 
-  // The SDK README documents the low-level get_screen call with projectId + screenId.
-  // Avoid Project#getScreen here because the generated wrapper also sends "name",
-  // which currently causes INVALID_ARGUMENT for otherwise valid listed screens.
+  // The current get_screen schema uses the canonical resource name.
+  // projectId and screenId are retained only to build that resource name.
   const screen = await client.callTool("get_screen", {
-    projectId: normalizedProjectId,
-    screenId: normalizedScreenId,
+    name: `projects/${normalizedProjectId}/screens/${normalizedScreenId}`,
   });
 
   const htmlUrl = screen?.htmlCode?.downloadUrl || "";

@@ -6,8 +6,9 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import { Stitch, StitchToolClient } from "@google/stitch-sdk";
 import * as z from "zod/v4";
 import { PROMPT_POLICY } from "./prompt-policy.mjs";
+import { readProjects, readScreens, readScreenContent } from "./stitch-read.mjs";
 
-const VERSION = "0.2.3";
+const VERSION = "0.2.4";
 const PORT = Number(process.env.PORT || 3000);
 const MAX_HTML_CHARS = Number(process.env.MAX_HTML_CHARS || 60000);
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN?.trim() || "";
@@ -192,7 +193,7 @@ async function createStitchSession() {
 async function withStitchSession(operation) {
   const { client, stitch } = await createStitchSession();
   try {
-    return await operation(stitch);
+    return await operation(stitch, client);
   } finally {
     try {
       await client.close();
@@ -254,38 +255,6 @@ function hash(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-async function screenInfo(screen) {
-  return {
-    screenId: screen.screenId,
-    id: screen.id,
-    projectId: screen.projectId,
-  };
-}
-
-async function screenContent(stitch, projectId, screenId, { includeImage = true, includeHtml = false } = {}) {
-  const project = stitch.project(projectId);
-  const screen = await project.getScreen(screenId);
-  const htmlUrl = await screen.getHtml();
-  const imageUrl = await screen.getImage();
-
-  const content = [{
-    type: "text",
-    text: JSON.stringify({ projectId, screenId, htmlUrl, imageUrl }, null, 2),
-  }];
-
-  if (includeImage && imageUrl) content.push(await downloadImage(imageUrl));
-
-  if (includeHtml && htmlUrl) {
-    const html = await downloadText(htmlUrl);
-    content.push({
-      type: "text",
-      text: `HTML da tela ${screenId}${html.truncated ? ` (truncado em ${MAX_HTML_CHARS} caracteres de ${html.originalLength})` : ""}\n\n${html.text}`,
-    });
-  }
-
-  return { content };
-}
-
 function buildServer() {
   const server = new McpServer(
     { name: "google-stitch-smart", version: VERSION },
@@ -336,13 +305,9 @@ function buildServer() {
     },
     async () => {
       try {
-        return await withStitchSession(async (stitch) => {
-          const projects = await stitch.projects();
-          return textResult({
-            count: projects.length,
-            projects: projects.map((p) => ({ projectId: p.projectId, id: p.id })),
-          });
-        });
+        return await withStitchSession(async (stitch) =>
+          textResult(await readProjects(stitch))
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -377,14 +342,9 @@ function buildServer() {
     },
     async ({ projectId }) => {
       try {
-        return await withStitchSession(async (stitch) => {
-          const screens = await stitch.project(projectId).screens();
-          return textResult({
-            projectId,
-            count: screens.length,
-            screens: await Promise.all(screens.map(screenInfo)),
-          });
-        });
+        return await withStitchSession(async (stitch) =>
+          textResult(await readScreens(stitch, projectId))
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -405,8 +365,14 @@ function buildServer() {
     },
     async (args) => {
       try {
-        return await withStitchSession((stitch) =>
-          screenContent(stitch, args.projectId, args.screenId, args)
+        return await withStitchSession((_stitch, client) =>
+          readScreenContent(
+            client,
+            args.projectId,
+            args.screenId,
+            args,
+            { downloadImage, downloadText, maxHtmlChars: MAX_HTML_CHARS }
+          )
         );
       } catch (error) {
         return errorResult(error);

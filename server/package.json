@@ -1,6 +1,6 @@
 {
   "name": "google-stitch-smart-mcp",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "type": "module",
   "description": "MCP bridge for Google Stitch with prompt-engineering-aware workflow for ChatGPT and Codex",
@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
-    "check": "node --check src/server.mjs && node --check src/prompt-policy.mjs"
+    "check": "node --check src/server.mjs && node --check src/prompt-policy.mjs && node --check src/stitch-read.mjs && node --check test/stitch-read.test.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@google/stitch-sdk": "latest",

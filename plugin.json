@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "google-stitch-smart",
-  "version": "0.2.1",
-  "description": "Integra ChatGPT ao Google Stitch com leitura de projetos e telas, geração, edição, variantes e engenharia de prompt orientada à preservação de escopo.",
+  "version": "0.2.2",
+  "description": "Integra ChatGPT ao Google Stitch com leitura de projetos e telas, geração, edição, variantes e transporte isolado por operação.",
   "keywords": [
     "google-stitch",
     "ui",
@@ -16,7 +16,7 @@
       "interface": {
         "displayName": "Google Stitch Smart",
         "shortDescription": "Acesse e refine telas do Google Stitch.",
-        "longDescription": "Conecta o ChatGPT ao Google Stitch via MCP e orienta criação e edição de telas com preservação de escopo e revisão visual.",
+        "longDescription": "Conecta o ChatGPT ao Google Stitch via MCP, com engenharia de prompt, preservação de escopo, revisão visual e sessão de transporte Stitch isolada por operação.",
         "developerName": "Reginatto-SI",
         "category": "Developer Tools",
         "capabilities": [

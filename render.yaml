@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: google-stitch-smart
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: STITCH_API_KEY
+        sync: false
+      - key: NODE_VERSION
+        value: "22"

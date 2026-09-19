@@ -1,5 +1,5 @@
 export const PROMPT_POLICY = {
-  version: "0.2.1",
+  version: "0.2.2",
   mission: "Transformar a intenção do usuário em instruções claras e com escopo preservado antes de executar ações no Google Stitch.",
   sourcePriority: [
     "Instrução atual do usuário",
@@ -17,7 +17,7 @@ export const PROMPT_POLICY = {
     "Usar nomes, rótulos e exemplos reais quando fornecidos; placeholders apenas quando necessários para composição visual.",
     "Incluir estados, responsividade e interações somente quando forem relevantes.",
     "Antes de executar uma escrita, resolver projeto/tela alvo e obter contexto suficiente para evitar alteração no recurso errado.",
-    "Após gerar ou editar, revisar o resultado visual. Não fazer uma segunda escrita automaticamente sem novo pedido do usuário."
+    "Após gerar ou editar, revisar o resultado visual. Não fazer uma segunda escrita automaticamente, salvo quando o usuário pedir iteração/autocorreção."
   ],
   editPreservationClause:
     "Preserve todos os demais elementos, conteúdos, estilos, componentes e comportamentos que não foram explicitamente mencionados nesta alteração."

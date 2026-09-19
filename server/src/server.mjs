@@ -1,45 +1,196 @@
 import "dotenv/config";
 import { createServer as createHttpServer } from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { Stitch, StitchToolClient } from "@google/stitch-sdk";
 import * as z from "zod/v4";
 import { PROMPT_POLICY } from "./prompt-policy.mjs";
 
-const VERSION = "0.2.2";
+const VERSION = "0.2.3";
 const PORT = Number(process.env.PORT || 3000);
 const MAX_HTML_CHARS = Number(process.env.MAX_HTML_CHARS || 60000);
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN?.trim() || "";
+const GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/aida";
+const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
-if (!process.env.STITCH_API_KEY && !process.env.STITCH_ACCESS_TOKEN) {
-  console.warn(
-    "[google-stitch-smart] STITCH_API_KEY/STITCH_ACCESS_TOKEN não definido. Ferramentas do Stitch falharão até a credencial ser configurada."
+let cachedOAuthToken = {
+  accessToken: "",
+  expiresAt: 0,
+};
+
+function oauthConfig() {
+  return {
+    clientId: process.env.GOOGLE_CLIENT_ID?.trim() || "",
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET?.trim() || "",
+    refreshToken: process.env.GOOGLE_REFRESH_TOKEN?.trim() || "",
+    projectId: process.env.GOOGLE_CLOUD_PROJECT?.trim() || "",
+  };
+}
+
+function authStatus() {
+  const oauth = oauthConfig();
+  const hasOAuthBase = Boolean(oauth.clientId && oauth.clientSecret && oauth.projectId);
+  const hasRefreshOAuth = Boolean(hasOAuthBase && oauth.refreshToken);
+  const hasStaticAccessToken = Boolean(
+    process.env.STITCH_ACCESS_TOKEN?.trim() && oauth.projectId
+  );
+  const hasApiKey = Boolean(process.env.STITCH_API_KEY?.trim());
+
+  return {
+    configured: hasRefreshOAuth || hasStaticAccessToken || hasApiKey,
+    mode: hasRefreshOAuth
+      ? "oauth_refresh_token"
+      : hasStaticAccessToken
+        ? "static_access_token"
+        : hasApiKey
+          ? "api_key"
+          : "none",
+    oauthReadyForAuthorization: hasOAuthBase,
+    oauthRefreshTokenConfigured: Boolean(oauth.refreshToken),
+    googleCloudProjectConfigured: Boolean(oauth.projectId),
+    scope: GOOGLE_OAUTH_SCOPE,
+  };
+}
+
+function oauthStateSecret() {
+  const { clientSecret } = oauthConfig();
+  if (!clientSecret) throw new Error("GOOGLE_CLIENT_SECRET não configurado");
+  return clientSecret;
+}
+
+function createOAuthState() {
+  const payload = Buffer.from(
+    JSON.stringify({ exp: Date.now() + 10 * 60 * 1000 }),
+    "utf8"
+  ).toString("base64url");
+  const signature = createHmac("sha256", oauthStateSecret())
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function verifyOAuthState(state) {
+  if (!state || !state.includes(".")) return false;
+  const [payload, signature] = state.split(".", 2);
+  const expected = createHmac("sha256", oauthStateSecret())
+    .update(payload)
+    .digest("base64url");
+
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length) return false;
+  if (!timingSafeEqual(actualBuffer, expectedBuffer)) return false;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return Number(parsed.exp) > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function externalOrigin(req) {
+  const proto =
+    req.headers["x-forwarded-proto"]?.toString().split(",")[0]?.trim() ||
+    (req.socket.encrypted ? "https" : "http");
+  const host =
+    req.headers["x-forwarded-host"]?.toString().split(",")[0]?.trim() ||
+    req.headers.host ||
+    "localhost";
+  return `${proto}://${host}`;
+}
+
+function oauthRedirectUri(req) {
+  return (
+    process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim() ||
+    `${externalOrigin(req)}/oauth/callback`
   );
 }
 
-function createStitchSession() {
-  const apiKey = process.env.STITCH_API_KEY?.trim() || "";
-  const accessToken = process.env.STITCH_ACCESS_TOKEN?.trim() || "";
+async function tokenRequest(params) {
+  const response = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams(params),
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = body.error_description || body.error || `HTTP ${response.status}`;
+    throw new Error(`Falha OAuth Google: ${detail}`);
+  }
+  return body;
+}
+
+async function refreshGoogleAccessToken() {
+  const { clientId, clientSecret, refreshToken, projectId } = oauthConfig();
+
+  if (!clientId || !clientSecret || !refreshToken || !projectId) {
+    throw new Error(
+      "OAuth incompleto. Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN e GOOGLE_CLOUD_PROJECT."
+    );
+  }
+
+  const now = Date.now();
+  if (
+    cachedOAuthToken.accessToken &&
+    cachedOAuthToken.expiresAt > now + 60_000
+  ) {
+    return cachedOAuthToken.accessToken;
+  }
+
+  const token = await tokenRequest({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: "refresh_token",
+  });
+
+  if (!token.access_token) {
+    throw new Error("Google OAuth não retornou access_token");
+  }
+
+  cachedOAuthToken = {
+    accessToken: token.access_token,
+    expiresAt: now + Number(token.expires_in || 3600) * 1000,
+  };
+
+  return cachedOAuthToken.accessToken;
+}
+
+async function createStitchSession() {
+  const status = authStatus();
   const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || "";
 
-  if (!apiKey && !accessToken) {
-    throw new Error("STITCH_API_KEY/STITCH_ACCESS_TOKEN não configurado");
-  }
-  if (!apiKey && accessToken && !projectId) {
-    throw new Error("GOOGLE_CLOUD_PROJECT é obrigatório quando STITCH_ACCESS_TOKEN é usado");
-  }
+  let client;
 
-  const client = new StitchToolClient({
-    ...(apiKey ? { apiKey } : {}),
-    ...(!apiKey && accessToken ? { accessToken, projectId } : {}),
-  });
+  if (status.mode === "oauth_refresh_token") {
+    const accessToken = await refreshGoogleAccessToken();
+    client = new StitchToolClient({ accessToken, projectId });
+  } else if (status.mode === "static_access_token") {
+    client = new StitchToolClient({
+      accessToken: process.env.STITCH_ACCESS_TOKEN.trim(),
+      projectId,
+    });
+  } else if (status.mode === "api_key") {
+    client = new StitchToolClient({
+      apiKey: process.env.STITCH_API_KEY.trim(),
+    });
+  } else {
+    throw new Error(
+      "Nenhuma credencial Stitch configurada. Configure OAuth renovável no Render."
+    );
+  }
 
   return { client, stitch: new Stitch(client) };
 }
 
 async function withStitchSession(operation) {
-  const { client, stitch } = createStitchSession();
+  const { client, stitch } = await createStitchSession();
   try {
     return await operation(stitch);
   } finally {
@@ -161,7 +312,8 @@ function buildServer() {
     async () => textResult({
       ok: true,
       version: VERSION,
-      stitchCredentialConfigured: Boolean(process.env.STITCH_API_KEY || process.env.STITCH_ACCESS_TOKEN),
+      stitchCredentialConfigured: authStatus().configured,
+      auth: authStatus(),
     })
   );
 
@@ -420,6 +572,8 @@ const httpServer = createHttpServer(async (req, res) => {
         version: VERSION,
         health: "/health",
         mcp: "/mcp",
+        oauthStart: "/oauth/start",
+        oauthCallback: "/oauth/callback",
       }));
       return;
     }
@@ -430,7 +584,89 @@ const httpServer = createHttpServer(async (req, res) => {
         ok: true,
         service: "google-stitch-smart",
         version: VERSION,
-        stitchCredentialConfigured: Boolean(process.env.STITCH_API_KEY || process.env.STITCH_ACCESS_TOKEN),
+        stitchCredentialConfigured: authStatus().configured,
+        auth: authStatus(),
+      }));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/oauth/start") {
+      const { clientId, clientSecret, projectId } = oauthConfig();
+      if (!clientId || !clientSecret || !projectId) {
+        res.writeHead(503, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          error: "oauth_not_configured",
+          message: "Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET e GOOGLE_CLOUD_PROJECT no Render antes de iniciar o OAuth.",
+          redirectUri: oauthRedirectUri(req),
+          requiredScope: GOOGLE_OAUTH_SCOPE,
+        }));
+        return;
+      }
+
+      const authorizationUrl = new URL(GOOGLE_AUTH_URL);
+      authorizationUrl.search = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: oauthRedirectUri(req),
+        response_type: "code",
+        scope: GOOGLE_OAUTH_SCOPE,
+        access_type: "offline",
+        prompt: "consent",
+        include_granted_scopes: "true",
+        state: createOAuthState(),
+      }).toString();
+
+      res.writeHead(302, { location: authorizationUrl.toString() });
+      res.end();
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/oauth/callback") {
+      const oauthError = url.searchParams.get("error");
+      if (oauthError) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          error: "oauth_denied",
+          detail: oauthError,
+        }));
+        return;
+      }
+
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+
+      if (!code || !verifyOAuthState(state)) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          error: "invalid_oauth_callback",
+          message: "Código OAuth ausente ou state inválido/expirado. Reinicie em /oauth/start.",
+        }));
+        return;
+      }
+
+      const { clientId, clientSecret } = oauthConfig();
+      const token = await tokenRequest({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: oauthRedirectUri(req),
+        grant_type: "authorization_code",
+      });
+
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        pragma: "no-cache",
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        message: token.refresh_token
+          ? "OAuth concluído. Copie GOOGLE_REFRESH_TOKEN para as Environment Variables do Render e faça novo deploy."
+          : "OAuth concluído, mas o Google não retornou refresh_token. Revogue o consentimento anterior ou reinicie /oauth/start; o fluxo já usa prompt=consent.",
+        GOOGLE_REFRESH_TOKEN: token.refresh_token || null,
+        scope: token.scope || GOOGLE_OAUTH_SCOPE,
+        expiresIn: token.expires_in || null,
+        tokenType: token.token_type || null,
+        important: "Não coloque este refresh token no GitHub nem compartilhe publicamente.",
       }));
       return;
     }
